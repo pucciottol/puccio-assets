@@ -1,0 +1,284 @@
+/**
+ * PuccioQuiz Google Apps Script Backend
+ * Handles all data storage and eligibility checks
+ * 
+ * Setup Instructions:
+ * 1. Create a Google Sheet with columns: Email, IP, Quiz_Date, Score, Answers, GDPR_Accepted, Wheel_Date, Prize, Token, Status
+ * 2. Create a Google Apps Script project bound to this sheet
+ * 3. Deploy as Web App (Execute as: Me, Who has access: Anyone)
+ * 4. Copy the deployment URL and update BACKEND_URL in config.js
+ */
+
+const SHEET_NAME = 'PuccioQuiz_Data';
+const SCRIPT_TIMEOUT = 30000; // 30 seconds
+
+// Get or create sheet
+function getSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET_NAME);
+    initializeSheet(sheet);
+  }
+  
+  return sheet;
+}
+
+// Initialize sheet with headers
+function initializeSheet(sheet) {
+  const headers = [
+    'Timestamp',
+    'Email',
+    'IP',
+    'Quiz_Score',
+    'Quiz_Answers',
+    'Quiz_Q10_Answers',
+    'GDPR_Accepted',
+    'Quiz_Date',
+    'Quiz_Status',
+    'Wheel_Accessed',
+    'Wheel_Date',
+    'Prize',
+    'Token',
+    'User_Agent'
+  ];
+  
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+  sheet.getRange(1, 1, 1, headers.length).setBackground('#333333');
+  sheet.getRange(1, 1, 1, headers.length).setFontColor('#ffffff');
+}
+
+// Main handler
+function doPost(e) {
+  try {
+    const payload = JSON.parse(e.postData.contents);
+    const action = payload.action;
+    
+    const response = {
+      success: false,
+      error: null,
+      data: null
+    };
+
+    switch(action) {
+      case API_CONFIG.CHECK_ELIGIBILITY:
+        response.data = checkEligibility(payload.email);
+        break;
+      
+      case API_CONFIG.SAVE_QUIZ:
+        response.data = saveQuizResult(payload);
+        break;
+      
+      case API_CONFIG.SAVE_WHEEL_RESULT:
+        response.data = saveWheelResult(payload);
+        break;
+      
+      case 'checkWheelEligibility':
+        response.data = checkWheelEligibility(payload.email, payload.ip);
+        break;
+      
+      default:
+        response.error = 'Action not recognized';
+        break;
+    }
+
+    response.success = !response.error;
+    return ContentService.createTextOutput(JSON.stringify(response))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch(error) {
+    Logger.log('Error: ' + error.toString());
+    return ContentService.createTextOutput(JSON.stringify({
+      success: false,
+      error: error.toString(),
+      data: null
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+// Check if user already took the quiz
+function checkEligibility(email) {
+  const sheet = getSheet();
+  const data = sheet.getDataRange().getValues();
+  
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] === email) { // Column B: Email
+      return {
+        eligible: false,
+        alreadyTaken: true,
+        message: 'Quiz already taken'
+      };
+    }
+  }
+  
+  return {
+    eligible: true,
+    alreadyTaken: false,
+    message: 'User is eligible'
+  };
+}
+
+// Save quiz result
+function saveQuizResult(payload) {
+  const sheet = getSheet();
+  const email = payload.email;
+  const score = payload.score;
+  const answers = JSON.stringify(payload.answers);
+  const q10 = JSON.stringify(payload.q10);
+  const timestamp = payload.timestamp;
+  
+  // Check again if already exists
+  const data = sheet.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] === email) {
+      return {
+        error: 'Email already exists',
+        saved: false
+      };
+    }
+  }
+  
+  // Get IP from header if available
+  let userIP = 'unknown';
+  try {
+    const request = getServerIpInfo();
+    userIP = request || 'unknown';
+  } catch(e) {
+    Logger.log('Could not get IP: ' + e);
+  }
+  
+  // Add new row
+  const newRow = [
+    timestamp,           // A: Timestamp
+    email,               // B: Email
+    userIP,              // C: IP
+    score,               // D: Quiz_Score
+    answers,             // E: Quiz_Answers
+    q10,                 // F: Quiz_Q10_Answers
+    payload.gdprAccepted ? 'Yes' : 'No', // G: GDPR_Accepted
+    new Date().toISOString(), // H: Quiz_Date
+    score === 9 ? 'Passed' : 'Failed', // I: Quiz_Status
+    score === 9 ? 'Yes' : 'No', // J: Wheel_Accessed
+    '',                  // K: Wheel_Date (empty until wheel is used)
+    '',                  // L: Prize (empty until wheel is used)
+    '',                  // M: Token (empty until wheel is used)
+    ''                   // N: User_Agent
+  ];
+  
+  sheet.appendRow(newRow);
+  
+  return {
+    saved: true,
+    score: score,
+    message: 'Quiz result saved',
+    eligible: score === 9
+  };
+}
+
+// Save wheel result
+function saveWheelResult(payload) {
+  const sheet = getSheet();
+  const email = payload.email;
+  const ip = payload.ip;
+  const prize = payload.prize;
+  const token = payload.token;
+  const timestamp = payload.timestamp;
+  
+  // First check if this email/IP has already used the wheel
+  const wheelCheckResponse = checkWheelEligibility(email, ip);
+  if(wheelCheckResponse.wheelAlreadyUsed) {
+    return wheelCheckResponse;
+  }
+  
+  // Find the quiz row for this email
+  const data = sheet.getDataRange().getValues();
+  let quizRowIndex = -1;
+  
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][1] === email) { // Column B: Email
+      quizRowIndex = i + 1; // +1 because getRange is 1-indexed
+      break;
+    }
+  }
+  
+  if (quizRowIndex === -1) {
+    return {
+      error: 'Email not found',
+      saved: false
+    };
+  }
+  
+  // Update the row with wheel result
+  sheet.getRange(quizRowIndex, 11).setValue(timestamp); // K: Wheel_Date
+  sheet.getRange(quizRowIndex, 12).setValue(prize);     // L: Prize
+  sheet.getRange(quizRowIndex, 13).setValue(token);     // M: Token
+  
+  return {
+    saved: true,
+    message: 'Wheel result saved',
+    prize: prize,
+    token: token
+  };
+}
+
+// Check wheel eligibility
+function checkWheelEligibility(email, ip) {
+  const sheet = getSheet();
+  const data = sheet.getDataRange().getValues();
+  
+  for (let i = 1; i < data.length; i++) {
+    const rowEmail = data[i][1];
+    const rowIP = data[i][2];
+    const wheelDate = data[i][10]; // K: Wheel_Date
+    
+    // Check if this email has already used the wheel
+    if (rowEmail === email && wheelDate !== '') {
+      return {
+        wheelAlreadyUsed: true,
+        reason: 'same_email',
+        error: 'This email has already used the wheel'
+      };
+    }
+    
+    // Check if this IP has already used the wheel
+    if (rowIP === ip && wheelDate !== '' && ip !== 'unknown') {
+      return {
+        wheelAlreadyUsed: true,
+        reason: 'same_ip',
+        error: 'This device has already used the wheel'
+      };
+    }
+  }
+  
+  return {
+    wheelAlreadyUsed: false,
+    eligible: true,
+    message: 'Wheel is available for this user'
+  };
+}
+
+// Helper to get server IP info
+function getServerIpInfo() {
+  try {
+    const response = UrlFetchApp.fetch('https://api.ipify.org?format=json', {
+      muteHttpExceptions: true,
+      timeout: 5000
+    });
+    
+    if (response.getResponseCode() === 200) {
+      const data = JSON.parse(response.getContentText());
+      return data.ip;
+    }
+  } catch(e) {
+    Logger.log('IP fetch error: ' + e);
+  }
+  
+  return 'unknown';
+}
+
+// Test function
+function testScript() {
+  const result = checkEligibility('test@example.com');
+  Logger.log('Test result: ' + JSON.stringify(result));
+}
